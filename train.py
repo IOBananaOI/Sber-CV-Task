@@ -1,7 +1,9 @@
 import torch
 import neptune
 import os
+import numpy as np
 
+from anls import anls_score
 from tqdm import tqdm
 
 def get_gradient_norm(model):
@@ -15,19 +17,38 @@ def get_gradient_norm(model):
     return total_norm
 
 
+def is_number(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def relaxed_correctness(labels, predictions, threshold=0.05):
+    if is_number(labels) and is_number(predictions):
+        return float(labels) * (1 - threshold) <= float(predictions) <= float(labels) * (1 + threshold)
+
+    return int(labels == predictions)
+
+
 def compute_metrics(labels, predictions):
     metrics = {
         "EM" : [],
-        "BLEU" : [],
-        "Relaxed corectness" : [],
+        "Relaxed correctness" : [],
         "ANLS" : [],
-        "CIDEr" : []
     }
+    print(labels, predictions)
     # Compute Exact match metric
     metrics['EM'] = int(labels == predictions)
     
-    # Compute BLEU metric
+    # Compute ANLS metric
+    metrics['ANLS'] = anls_score(prediction=predictions, gold_labels=[labels], threshold=0.5)
+
+    # Compute Relaxed accuracy
+    metrics['Relaxed correctness'] = relaxed_correctness(labels, predictions)
     
+    return metrics
 
 
 def train_model(model, 
@@ -69,6 +90,9 @@ def train_model(model,
                 optimizer.zero_grad()
                 
                 gnorm = get_gradient_norm(model)
+
+                if scheduler is not None:
+                    scheduler.step()
                 
                 if neptune_tracking:
                     run['Loss (Train)'].append(loss.item())
@@ -80,10 +104,8 @@ def train_model(model,
             test_metrics = {
                 "Loss (Test)" : [],
                 "EM" : [],
-                "BLEU" : [],
-                "Relaxed corectness" : [],
+                "Relaxed correctness" : [],
                 "ANLS" : [],
-                "CIDEr" : []
             }
             
             for i, batch in enumerate(test_dl):
@@ -98,20 +120,25 @@ def train_model(model,
                 loss = outputs.loss
                 test_metrics['Loss (Test)'].append(loss.item())
                 
+                predictions = model.generate(flattened_patches=flattened_patches, attention_mask=attention_mask)
+                decoded_prediction = processor.batch_decode(predictions, skip_special_tokens=True)[0]
+                decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)[0]
                 
-                
-                
-                if i < 3:
-                    predictions = model.generate(flattened_patches=flattened_patches, attention_mask=attention_mask)        
-                    print("Predictions:", processor.batch_decode(predictions, skip_special_tokens=True))
-                    print("Ground-truth:", processor.batch_decode(labels, skip_special_tokens=True))
+                if i < 3:        
+                    print("Predictions:", decoded_prediction)
+                    print("Ground-truth:", decoded_labels)
                     
+                batch_metrics = compute_metrics(decoded_labels, decoded_prediction)
                 
-                    
+                for k, v in batch_metrics.items():
+                    test_metrics[k].append(v)
                     
                 if neptune_tracking:
-                    pass
+                    for k, v in test_metrics.items():
+                        run[f"{k}"].append(np.mean(v))
                 else:
                     print(f"Loss (Test): {loss.item()}")
+                    for k, v in test_metrics.items():
+                        print(f"{k}:", np.mean(v))
                     
         torch.save(model.state_dict(), f'weights/ep_{epoch+1}.pth')

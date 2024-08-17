@@ -28,7 +28,7 @@ def is_number(s):
 def relaxed_correctness(labels, predictions, threshold=0.05):
     if is_number(labels) and is_number(predictions):
         return float(labels) * (1 - threshold) <= float(predictions) <= float(labels) * (1 + threshold)
-
+    
     return int(labels == predictions)
 
 
@@ -38,7 +38,9 @@ def compute_metrics(labels, predictions):
         "Relaxed correctness" : [],
         "ANLS" : [],
     }
-    print(labels, predictions)
+    labels = labels.lower()
+    predictions = predictions.lower()
+    
     # Compute Exact match metric
     metrics['EM'] = int(labels == predictions)
     
@@ -60,6 +62,7 @@ def train_model(model,
                 device,
                 scheduler=None,
                 neptune_tracking=True,
+                model_name="",
                 start_epoch=0):
     
     if neptune_tracking:
@@ -73,7 +76,7 @@ def train_model(model,
         model.train()
         with tqdm(train_dl) as tepoch:
             tepoch.set_description(f"Epoch: {epoch + 1}: Train stage")
-            for i, batch in enumerate(tepoch):                
+            for step, batch in enumerate(tepoch):                
                 labels = batch.pop("labels").to(device).squeeze(1)
                 flattened_patches = batch.pop("flattened_patches").to(device).squeeze(1)
                 attention_mask = batch.pop("attention_mask").to(device).squeeze(1)
@@ -98,47 +101,55 @@ def train_model(model,
                     run['Loss (Train)'].append(loss.item())
                     run['Gradient norm'].append(gnorm)
                     run['Learning rate'].append(optimizer.param_groups[0]['lr'])
+                    
+                if (step + 1) % 100 == 0:
+                    model.eval()
+                    with torch.no_grad():
+                        test_metrics = {
+                            "Loss (Test)" : [],
+                            "EM" : [],
+                            "Relaxed correctness" : [],
+                            "ANLS" : [],
+                        }
                         
-        model.eval()
-        with torch.no_grad():
-            test_metrics = {
-                "Loss (Test)" : [],
-                "EM" : [],
-                "Relaxed correctness" : [],
-                "ANLS" : [],
-            }
-            
-            for i, batch in enumerate(test_dl):
-                labels = batch.pop("labels").to(device).squeeze(1)
-                flattened_patches = batch.pop("flattened_patches").to(device).squeeze(1)
-                attention_mask = batch.pop("attention_mask").to(device).squeeze(1)
-                
-                outputs = model(flattened_patches=flattened_patches,
-                                attention_mask=attention_mask,
-                                labels=labels)
-                
-                loss = outputs.loss
-                test_metrics['Loss (Test)'].append(loss.item())
-                
-                predictions = model.generate(flattened_patches=flattened_patches, attention_mask=attention_mask)
-                decoded_prediction = processor.batch_decode(predictions, skip_special_tokens=True)[0]
-                decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)[0]
-                
-                if i < 3:        
-                    print("Predictions:", decoded_prediction)
-                    print("Ground-truth:", decoded_labels)
-                    
-                batch_metrics = compute_metrics(decoded_labels, decoded_prediction)
-                
-                for k, v in batch_metrics.items():
-                    test_metrics[k].append(v)
-                    
-                if neptune_tracking:
-                    for k, v in test_metrics.items():
-                        run[f"{k}"].append(np.mean(v))
-                else:
-                    print(f"Loss (Test): {loss.item()}")
-                    for k, v in test_metrics.items():
-                        print(f"{k}:", np.mean(v))
-                    
-        torch.save(model.state_dict(), f'weights/ep_{epoch+1}.pth')
+                        with tqdm(test_dl) as val_stage:
+                            val_stage.set_description(f"Epoch: {epoch + 1}: Val stage")
+                            for batch in val_stage:
+                                labels = batch.pop("labels").to(device).squeeze(1)
+                                flattened_patches = batch.pop("flattened_patches").to(device).squeeze(1)
+                                attention_mask = batch.pop("attention_mask").to(device).squeeze(1)
+                                
+                                outputs = model(flattened_patches=flattened_patches,
+                                                attention_mask=attention_mask,
+                                                labels=labels)
+                                
+                                loss = outputs.loss
+                                test_metrics['Loss (Test)'].append(loss.item())
+                                
+                                predictions = model.generate(flattened_patches=flattened_patches, attention_mask=attention_mask)
+                                decoded_prediction = processor.batch_decode(predictions, skip_special_tokens=True)[0]
+                                decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)[0]
+                                    
+                                batch_metrics = compute_metrics(decoded_labels, decoded_prediction)
+                                
+                                for k, v in batch_metrics.items():
+                                    test_metrics[k].append(v)
+                                
+                            if neptune_tracking:
+                                for k, v in test_metrics.items():
+                                    run[f"{k}"].append(np.mean(v))
+                            else:
+                                print(f"Loss (Test): {loss.item()}")
+                                for k, v in test_metrics.items():
+                                    print(f"{k}:", np.mean(v))
+                                
+                    state = {
+                        'epoch': epoch + 1,
+                        'state_dict': model.state_dict(),
+                        'optimizer': optimizer.state_dict()
+                    }
+                            
+                    torch.save(state, f'weights/{model_name}_step_{step+1}.pth')
+                    model.train()
+                        
+        
